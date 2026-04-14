@@ -1,81 +1,117 @@
 
-import { GoogleGenAI, Type, Modality } from "@google/genai";
+import { GoogleGenAI, Type, Modality, ThinkingLevel } from "@google/genai";
 import { MnemonicResponse, Language } from "../types";
 
 export class GeminiService {
+  private aiInstance: GoogleGenAI | null = null;
   private apiKeys: string[] = [];
-  private currentKeyIndex = 0;
+  private currentKeyIndex: number = 0;
 
-  constructor() {
-    // In Vite, variables must be accessed via import.meta.env
-    let loadedKeys: string[] = [];
+  private initKeys() {
+    if (this.apiKeys.length > 0) return;
     
-    // 1. Try the comma-separated list
-    const keysString = import.meta.env.VITE_GEMINI_API_KEYS;
-    if (keysString && keysString !== 'undefined') {
-      loadedKeys = keysString.split(',').map((k: string) => k.trim()).filter(Boolean);
+    const rawKeys = process.env.GEMINI_API_KEY;
+    if (!rawKeys) {
+      throw new Error("Gemini API Key not found. Please ensure GEMINI_API_KEY is set.");
     }
-
-    // 2. Try individual keys
-    const individualKeys = [
-      import.meta.env.VITE_GEMINI_API_KEY,
-      import.meta.env.VITE_GEMINI_API_KEY_2,
-      import.meta.env.VITE_GEMINI_API_KEY_3,
-      import.meta.env.VITE_GEMINI_API_KEY_4,
-      import.meta.env.VITE_GEMINI_API_KEY_5,
-      // Special case: AI Studio's default key
-      (import.meta.env as any).GEMINI_API_KEY 
-    ].filter(k => k && k !== 'undefined') as string[];
-
-    // Combine and remove duplicates
-    this.apiKeys = Array.from(new Set([...loadedKeys, ...individualKeys]));
     
+    this.apiKeys = rawKeys.split(',')
+      .map(k => k.trim())
+      .filter(k => k.length > 0);
+      
     if (this.apiKeys.length === 0) {
-      console.error("CRITICAL: No Gemini API keys found in environment variables!");
-    } else {
-      console.log(`GeminiService: Successfully initialized with ${this.apiKeys.length} total unique keys.`);
+      throw new Error("No valid Gemini API keys found in GEMINI_API_KEY.");
     }
   }
 
-  private getAI(version: 'v1' | 'v1beta' = 'v1') {
-    if (this.apiKeys.length === 0) {
-      throw new Error("Gemini API Key not found.");
-    }
+  private getAI() {
+    this.initKeys();
+    if (this.aiInstance) return this.aiInstance;
+    
     const apiKey = this.apiKeys[this.currentKeyIndex];
-    // Modern SDK initialization
-    return new GoogleGenAI({ apiKey, apiVersion: version });
+    this.aiInstance = new GoogleGenAI({ apiKey });
+    return this.aiInstance;
   }
 
-  private rotateKey() {
+  private rotateKey(): boolean {
+    this.initKeys();
     if (this.apiKeys.length > 1) {
       this.currentKeyIndex = (this.currentKeyIndex + 1) % this.apiKeys.length;
-      console.warn(`Quota reached. Rotating to API Key #${this.currentKeyIndex + 1}`);
+      this.aiInstance = null;
+      console.warn(`Rotating to API key index ${this.currentKeyIndex + 1}/${this.apiKeys.length}`);
+      return true;
     }
+    return false;
   }
 
-  private async withRetry<T>(fn: () => Promise<T>, maxRetries = 5): Promise<T> {
+  /**
+   * Robust exponential backoff retry logic for handling transient API errors and rate limits.
+   * Also handles API key rotation if multiple keys are provided.
+   */
+  private async withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
     let lastError: any;
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    let rotationCount = 0;
+    
+    // Total attempts = initial + maxRetries + potentially rotating through all keys
+    const maxAttempts = maxRetries + 1;
+
+    for (let attempt = 0; attempt < maxAttempts + rotationCount; attempt++) {
       try {
         return await fn();
       } catch (error: any) {
         lastError = error;
+        
+        // Extract status code from various possible error structures
+        const status = error?.status || error?.error?.code || error?.status_code;
         const message = error?.message || (typeof error === 'string' ? error : '');
+        const errorBodyString = error?.response?.body ? JSON.stringify(error.response.body) : '';
         
         const isQuotaError = 
+          status === 429 || 
           message.includes('429') || 
           message.includes('RESOURCE_EXHAUSTED') ||
-          message.toLowerCase().includes('quota exceeded');
+          message.toLowerCase().includes('quota exceeded') ||
+          errorBodyString.includes('429') ||
+          errorBodyString.includes('RESOURCE_EXHAUSTED');
 
         if (isQuotaError) {
-          this.rotateKey();
+          if (this.rotateKey()) {
+            rotationCount++;
+            // If we have more keys to try, retry immediately with the new key
+            if (rotationCount < this.apiKeys.length) {
+              console.warn(`Quota exceeded for key ${this.currentKeyIndex}. Retrying with next key...`);
+              continue;
+            }
+          }
         }
 
-        if (attempt < maxRetries) {
-          const delay = (Math.pow(2, attempt + 1) - 1) * 1000 + Math.random() * 1000;
-          console.warn(`Retrying after error (Attempt ${attempt + 1}/${maxRetries}) in ${Math.round(delay)}ms. Message: ${message}`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-          continue;
+        const isServerError = 
+          (status >= 500 && status < 600) || 
+          message.includes('500') || 
+          message.includes('503');
+
+        // Handle "Requested entity was not found" which can happen during key selection race conditions
+        const isNotFoundError = message.includes('Requested entity was not found');
+
+        // Handle transient network errors like "Failed to fetch"
+        const isNetworkError = 
+          message.includes('Failed to fetch') || 
+          message.includes('NetworkError') || 
+          message.includes('fetch failed') ||
+          message.includes('ERR_CONNECTION_CLOSED') ||
+          message.includes('ERR_INTERNET_DISCONNECTED') ||
+          message.includes('ERR_NETWORK_CHANGED') ||
+          message.includes('ERR_CONNECTION_RESET') ||
+          error instanceof TypeError;
+
+        if (isQuotaError || isServerError || isNotFoundError || isNetworkError) {
+          if (attempt < maxAttempts + rotationCount - 1) {
+            // Reduced delay: 2s, 5s... to better handle strict quotas without long waits
+            const delay = (Math.pow(2, attempt + 1) - 1) * 1000 + Math.random() * 1000;
+            console.warn(`Retrying after error ${status || 'unknown'} (Attempt ${attempt + 1}/${maxAttempts + rotationCount}) in ${Math.round(delay)}ms. Message: ${message}`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
         }
         throw error;
       }
@@ -88,16 +124,22 @@ export class GeminiService {
       const ai = this.getAI();
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
-        contents: `Correct the spelling of the following English word: "${word}". Return ONLY the corrected word.`,
+        contents: `Correct the spelling of the following English word: "${word}". 
+        Return ONLY the corrected word. If the word is already correct, return it as is. 
+        Do not include any punctuation or explanations.`,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
+        }
       });
 
-      return response.text?.trim().toLowerCase().replace(/[^a-z\s-]/g, '') || word.toLowerCase();
+      const corrected = response.text?.trim().toLowerCase().replace(/[^a-z\s-]/g, '');
+      return corrected || word.toLowerCase();
     });
   }
 
   async getMnemonic(word: string, targetLanguage: Language): Promise<MnemonicResponse> {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1beta');
+      const ai = this.getAI();
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
         contents: `Generate a mnemonic for the English word "${word}" for a ${targetLanguage} speaker.`,
@@ -116,48 +158,53 @@ export class GeminiService {
               examples: { 
                   type: Type.ARRAY,
                   items: { type: Type.STRING },
-                  description: "2-3 English sentences with their ${targetLanguage} translations in parentheses"
+                  description: "2-3 English sentences with their ${targetLanguage} translations"
               },
               synonyms: {
                   type: Type.ARRAY,
                   items: { type: Type.STRING },
                   description: "3-5 English synonyms followed by their ${targetLanguage} translations in parentheses"
               },
-              level: { type: Type.STRING },
-              category: { type: Type.STRING },
-              imagePrompt: { type: Type.STRING }
+              level: { 
+                  type: Type.STRING, 
+                  description: "CEFR level of the word (Beginner, Pre-Intermediate, Intermediate, Advanced)" 
+              },
+              category: { 
+                  type: Type.STRING, 
+                  description: "One of the top 20 categories: Crime, Technology, Medicine, Education, Environment, Economy, Travel, Food, Sports, Art, Science, Law, Business, Health, History, Politics, Media, Nature, People, Daily Life." 
+              },
+              imagePrompt: { type: Type.STRING, description: "Detailed visual description for an image generation AI" }
             },
             required: ["word", "transcription", "meaning", "morphology", "imagination", "phoneticLink", "connectorSentence", "examples", "synonyms", "level", "category", "imagePrompt"]
           },
-          systemInstruction: `Role: You are a Linguistic Mnemonic Architect specializing in the "Keyword Method". Your goal is to help users acquire English vocabulary by building a two-stage mnemonic chain consisting of an acoustic link and an imagery link.
-          
-          You MUST provide high-quality, creative, and memorable stories. For Central Asian languages (Uzbek, Kazakh, Kyrgyz, Tajik, Turkmen), ensure the phonetic links are culturally relevant and phonetically accurate.
-          
-          Instructions for Content Generation:
-          1. The Acoustic Link (phoneticLink)
-          - Identify a "Keyword" in ${targetLanguage} that sounds as much as possible like a part of the spoken English word.
-          - Priority: Favor the initial syllable or the most stressed part of the English word for better retrieval.
-          - Constraint: The keyword must be a concrete noun or an easily visualized object/phrase. Avoid abstract concepts.
-          - Explanation: Explain WHY this keyword was chosen and how it sounds like the English word.
-          
-          2. The Imagery Link (imagination)
-          - Create a vivid mental image description where the Keyword and the English Translation interact in a graphic, dynamic, and memorable way.
-          - Absurdity Factor: The interaction should be unique, absurd, or exaggerated.
-          - Fusion: The scene must be a single "fused" picture where the two items are locked together.
-          
-          3. Covert Cognate Check
-          - Before forcing a keyword, check if a "covert cognate" exists (a word with a shared root in ${targetLanguage}).
-          - If a cognate is found, prioritize explaining that relationship first in the phoneticLink field.
-          
-          4. Examples & Synonyms
-          - Every example sentence MUST be followed by its translation in ${targetLanguage} in parentheses.
-          - Every synonym MUST be followed by its translation in ${targetLanguage} in parentheses.
-          
-          CRITICAL RULES:
-          1. All explanatory fields (meaning, morphology, imagination, phoneticLink, connectorSentence) MUST be written EXCLUSIVELY in ${targetLanguage}.
-          2. The "word" field should remain the original English word.
-          3. The "imagePrompt" MUST be a detailed, English-only visual description of the scene described in the "imagination" field. Focus on characters, actions, and specific visual details to help an AI generate a matching image.
-          4. Return ONLY a valid JSON object.`
+          systemInstruction: `Role: You are a Linguistic Mnemonic Architect specializing in the "Keyword Method" established by Raugh and Atkinson at Stanford University. Your goal is to help users acquire English vocabulary by building a two-stage mnemonic chain consisting of an acoustic link and an imagery link.
+
+Instructions for Content Generation:
+1. The Acoustic Link (phoneticLink)
+- Identify a "Keyword" in ${targetLanguage} that sounds as much as possible like a part of the spoken English word.
+- Priority: Favor the initial syllable or the most stressed part of the English word for better retrieval.
+- Constraint: The keyword must be a concrete noun or an easily visualized object/phrase. Avoid abstract concepts.
+
+2. The Imagery Link (imagination)
+- Create a vivid mental image description where the Keyword and the English Translation interact in a graphic, dynamic, and memorable way.
+- Absurdity Factor: The interaction should be unique, absurd, or exaggerated.
+- Fusion: The scene must be a single "fused" picture where the two items are locked together.
+
+3. Covert Cognate Check
+- Before forcing a keyword, check if a "covert cognate" exists (a word with a shared root in ${targetLanguage}).
+- If a cognate is found, prioritize explaining that relationship first in the phoneticLink field.
+
+4. Audio & Phonetic Guidance
+- Provide the IPA transcription for the English word.
+
+5. Visual Generation Prompt (imagePrompt)
+- Write a detailed, high-fidelity image generation prompt.
+- Specify a scene that visually integrates the Native Keyword and the English Meaning in a single, high-contrast, and memorable artistic style (naturalistic or traditional based on ${targetLanguage} culture).
+
+CRITICAL RULES:
+1. All explanatory fields (meaning, morphology, imagination, phoneticLink, connectorSentence) MUST be written EXCLUSIVELY in ${targetLanguage}.
+2. The "word" field should remain the original English word.
+3. Return ONLY a valid JSON object.`
         },
       });
 
@@ -169,42 +216,46 @@ export class GeminiService {
 
   async generateImage(prompt: string): Promise<string> {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1beta');
+      const ai = this.getAI();
       const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash-image",
-        contents: [{ 
-          parts: [{ 
-            text: `Generate a high-quality, vibrant, and detailed illustration based on this description: ${prompt}. The style should be consistent with educational mnemonics—clear, slightly whimsical, and memorable. No text in the image.` 
-          }] 
-        }],
+        model: 'gemini-2.5-flash-image',
+        contents: {
+          parts: [{ text: `${prompt}. High-fidelity, high-contrast, cinematic lighting, no text, no labels, 4k resolution.` }],
+        },
         config: {
-          responseModalities: [Modality.IMAGE],
+          imageConfig: {
+            aspectRatio: "1:1",
+            imageSize: "1K"
+          }
         },
       });
 
-      const part = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
-      if (!part || !part.inlineData) {
-        throw new Error("No image data received from API");
+      const candidates = response.candidates;
+      if (candidates && candidates.length > 0 && candidates[0].content && candidates[0].content.parts) {
+        for (const part of candidates[0].content.parts) {
+          if (part.inlineData && part.inlineData.data) {
+            const base64EncodeString: string = part.inlineData.data;
+            return `data:${part.inlineData.mimeType || 'image/png'};base64,${base64EncodeString}`;
+          }
+        }
       }
-
-      return `data:image/png;base64,${part.inlineData.data}`;
+      return '';
     });
   }
 
   async generateTTS(text: string, targetLanguage: Language): Promise<string> {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1beta');
+      const ai = this.getAI();
       
+      // Explicitly map language enum to full names for the AI
       const languageName = targetLanguage === Language.ENGLISH ? 'English' : targetLanguage;
 
       const response = await ai.models.generateContent({
         model: "gemini-2.5-flash-preview-tts",
         contents: [{ 
           parts: [{ 
-            text: `Speak the following text naturally and expressively. It contains English words and their explanation in ${languageName}. 
-            For English words, use a clear American accent. 
-            For ${languageName} (which could be Kazakh, Kyrgyz, Tajik, Turkmen, or Uzbek), use a native, fluent, and authentic accent. 
-            Ensure the pronunciation of Central Asian languages is accurate and high-quality.
+            text: `Read the following text aloud. It contains English words and their explanation in ${languageName}. 
+            Please use a clear, standard English accent for the English words and a natural, fluent ${languageName} accent for the rest of the text.
             Text: "${text}"` 
           }] 
         }],
@@ -212,15 +263,20 @@ export class GeminiService {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
             voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: 'Zephyr' }, // Trying Zephyr for potentially more natural feel
+              prebuiltVoiceConfig: { voiceName: 'Kore' },
             },
           },
         },
       });
 
-      const audioData = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
-      if (audioData) {
-        return audioData;
+      const candidates = response.candidates;
+      if (candidates && candidates.length > 0 && candidates[0].content && candidates[0].content.parts) {
+        const parts = candidates[0].content.parts;
+        for (const part of parts) {
+          if (part.inlineData && part.inlineData.data) {
+            return part.inlineData.data;
+          }
+        }
       }
       
       console.error("TTS Response missing audio parts:", response);
@@ -230,7 +286,7 @@ export class GeminiService {
 
   async getPracticeResponse(word: string, meaning: string, targetLanguage: Language, history: any[], level?: 'Easy' | 'Medium' | 'Hard' | 'EasyToHard', sentenceCount: number = 0) {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1beta');
+      const ai = this.getAI();
       
       const levelInstructions = {
         Easy: "Focus on SIMPLE sentences (Subject + Verb + Object). Use high-frequency, basic vocabulary. Example structure: 'The cat sits on the mat.'",
@@ -248,12 +304,15 @@ export class GeminiService {
         ? (sentenceCount < 2 ? 'Easy' : sentenceCount < 4 ? 'Medium' : 'Hard')
         : (level || 'Easy');
 
+      // If history is empty, we need an initial prompt to trigger the first greeting
+      const contents = history.length > 0 ? history : [{
+        role: 'user',
+        parts: [{ text: `Hi! I want to practice the word "${word}". I've chosen the ${level === 'EasyToHard' ? 'Easy to Hard' : (level || 'Easy')} level. Please start the session in ${targetLanguage}.` }]
+      }];
+
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
-        contents: history.length > 0 ? history : [{
-          role: 'user',
-          parts: [{ text: `Hi! I want to practice the word "${word}". I've chosen the ${level === 'EasyToHard' ? 'Easy to Hard' : (level || 'Easy')} level. Please start the session in ${targetLanguage}.` }]
-        }],
+        contents,
         config: {
           responseMimeType: "application/json",
           responseSchema: {
@@ -290,7 +349,7 @@ export class GeminiService {
 
   async generateNuance(word: string, synonyms: string[], targetLanguage: Language): Promise<any> {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1beta');
+      const ai = this.getAI();
       const synonymsList = synonyms && synonyms.length > 0 ? synonyms.join(', ') : 'common synonyms';
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
