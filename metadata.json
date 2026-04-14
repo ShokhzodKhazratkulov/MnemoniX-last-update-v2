@@ -1,0 +1,7 @@
+{
+  "name": "MnemoniX: Master vocabulary with mnemonics v2 monetize",
+  "description": "Xorijiy so\u0027zlarni assotsiatsiyalar va qiziqarli tasavvurlar orqali bir zumda eslab qolishga yordam beruvchi aqlli yordamchi.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
