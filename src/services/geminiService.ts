@@ -10,14 +10,14 @@ export class GeminiService {
   private initKeys() {
     if (this.apiKeys.length > 0) return;
     
-    const rawKeys = process.env.GEMINI_API_KEY;
+    const rawKeys = import.meta.env.VITE_GEMINI_API_KEYS;
     if (!rawKeys) {
-      throw new Error("Gemini API Key not found. Please ensure GEMINI_API_KEY is set.");
+      throw new Error("Gemini API Keys not found. Please ensure VITE_GEMINI_API_KEYS is set.");
     }
     
     this.apiKeys = rawKeys.split(',')
-      .map(k => k.trim())
-      .filter(k => k.length > 0);
+      .map((k: string) => k.trim())
+      .filter((k: string) => k.length > 0);
       
     if (this.apiKeys.length === 0) {
       throw new Error("No valid Gemini API keys found in GEMINI_API_KEY.");
