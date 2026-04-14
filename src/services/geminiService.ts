@@ -50,7 +50,7 @@ export class GeminiService {
       throw new Error("Gemini API Key not found. Please ensure VITE_GEMINI_API_KEYS or VITE_GEMINI_API_KEY is set in your settings.");
     }
     const apiKey = this.apiKeys[this.currentKeyIndex];
-    return new GoogleGenAI({ apiKey });
+    return new GoogleGenAI({ apiKey, apiVersion: 'v1beta' });
   }
 
   private rotateKey() {
@@ -141,7 +141,7 @@ export class GeminiService {
     return this.withRetry(async () => {
       const ai = this.getAI();
       const response = await ai.models.generateContent({
-        model: "gemini-1.5-pro",
+        model: "gemini-1.5-flash",
         contents: `Generate a mnemonic for the English word "${word}" for a ${targetLanguage} speaker.`,
         config: {
           responseMimeType: "application/json",
@@ -293,7 +293,7 @@ export class GeminiService {
       }];
 
       const response = await ai.models.generateContent({
-        model: "gemini-1.5-pro",
+        model: "gemini-1.5-flash",
         contents,
         config: {
           responseMimeType: "application/json",
@@ -334,7 +334,7 @@ export class GeminiService {
       const ai = this.getAI();
       const synonymsList = synonyms && synonyms.length > 0 ? synonyms.join(', ') : 'common synonyms';
       const response = await ai.models.generateContent({
-        model: "gemini-1.5-pro",
+        model: "gemini-1.5-flash",
         contents: `Explain the nuance and usage differences between the English word "${word}" and its synonyms: ${synonymsList}. Provide the explanation for a ${targetLanguage} speaker.`,
         config: {
           responseMimeType: "application/json",
