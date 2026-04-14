@@ -97,7 +97,7 @@ export class GeminiService {
 
   async getMnemonic(word: string, targetLanguage: Language): Promise<MnemonicResponse> {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1');
+      const ai = this.getAI('v1beta');
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
         contents: `Generate a mnemonic for the English word "${word}" for a ${targetLanguage} speaker.`,
@@ -169,7 +169,7 @@ export class GeminiService {
 
   async generateImage(prompt: string): Promise<string> {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1');
+      const ai = this.getAI('v1beta');
       const response = await ai.models.generateContent({
         model: "gemini-2.5-flash-image",
         contents: [{ 
@@ -230,7 +230,7 @@ export class GeminiService {
 
   async getPracticeResponse(word: string, meaning: string, targetLanguage: Language, history: any[], level?: 'Easy' | 'Medium' | 'Hard' | 'EasyToHard', sentenceCount: number = 0) {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1');
+      const ai = this.getAI('v1beta');
       
       const levelInstructions = {
         Easy: "Focus on SIMPLE sentences (Subject + Verb + Object). Use high-frequency, basic vocabulary. Example structure: 'The cat sits on the mat.'",
@@ -290,7 +290,7 @@ export class GeminiService {
 
   async generateNuance(word: string, synonyms: string[], targetLanguage: Language): Promise<any> {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1');
+      const ai = this.getAI('v1beta');
       const synonymsList = synonyms && synonyms.length > 0 ? synonyms.join(', ') : 'common synonyms';
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
