@@ -7,59 +7,74 @@ export class GeminiService {
   private currentKeyIndex = 0;
 
   constructor() {
+    // In Vite, variables must be accessed via import.meta.env
     let loadedKeys: string[] = [];
+    
+    // 1. Try the comma-separated list
     const keysString = import.meta.env.VITE_GEMINI_API_KEYS;
     if (keysString && keysString !== 'undefined') {
       loadedKeys = keysString.split(',').map((k: string) => k.trim()).filter(Boolean);
     }
 
+    // 2. Try individual keys
     const individualKeys = [
       import.meta.env.VITE_GEMINI_API_KEY,
       import.meta.env.VITE_GEMINI_API_KEY_2,
       import.meta.env.VITE_GEMINI_API_KEY_3,
       import.meta.env.VITE_GEMINI_API_KEY_4,
       import.meta.env.VITE_GEMINI_API_KEY_5,
+      // Special case: AI Studio's default key
       (import.meta.env as any).GEMINI_API_KEY 
     ].filter(k => k && k !== 'undefined') as string[];
 
+    // Combine and remove duplicates
     this.apiKeys = Array.from(new Set([...loadedKeys, ...individualKeys]));
     
     if (this.apiKeys.length === 0) {
-      console.error("CRITICAL: No Gemini API keys found!");
+      console.error("CRITICAL: No Gemini API keys found in environment variables!");
     } else {
-      console.log(`GeminiService: Initialized with ${this.apiKeys.length} keys.`);
+      console.log(`GeminiService: Successfully initialized with ${this.apiKeys.length} total unique keys.`);
     }
   }
 
-  private getAI(version: 'v1' | 'v1beta' = 'v1') {
+  private getAI() {
     if (this.apiKeys.length === 0) {
-      throw new Error("API Key missing");
+      throw new Error("Gemini API Key not found.");
     }
     const apiKey = this.apiKeys[this.currentKeyIndex];
-    return new GoogleGenAI({ apiKey, apiVersion: version });
+    // Modern SDK initialization
+    return new GoogleGenAI({ apiKey });
   }
 
   private rotateKey() {
     if (this.apiKeys.length > 1) {
       this.currentKeyIndex = (this.currentKeyIndex + 1) % this.apiKeys.length;
-      console.warn(`Rotating to Key #${this.currentKeyIndex + 1}`);
+      console.warn(`Quota reached. Rotating to API Key #${this.currentKeyIndex + 1}`);
     }
   }
 
-  private async withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
+  private async withRetry<T>(fn: () => Promise<T>, maxRetries = 5): Promise<T> {
     let lastError: any;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         return await fn();
       } catch (error: any) {
         lastError = error;
-        const message = error?.message || '';
-        if (message.includes('429') || message.includes('quota') || message.includes('RESOURCE_EXHAUSTED')) {
+        const message = error?.message || (typeof error === 'string' ? error : '');
+        
+        const isQuotaError = 
+          message.includes('429') || 
+          message.includes('RESOURCE_EXHAUSTED') ||
+          message.toLowerCase().includes('quota exceeded');
+
+        if (isQuotaError) {
           this.rotateKey();
         }
+
         if (attempt < maxRetries) {
-          const delay = Math.pow(2, attempt) * 1000;
-          await new Promise(r => setTimeout(r, delay));
+          const delay = (Math.pow(2, attempt + 1) - 1) * 1000 + Math.random() * 1000;
+          console.warn(`Retrying after error (Attempt ${attempt + 1}/${maxRetries}) in ${Math.round(delay)}ms. Message: ${message}`);
+          await new Promise(resolve => setTimeout(resolve, delay));
           continue;
         }
         throw error;
@@ -70,21 +85,22 @@ export class GeminiService {
 
   async checkSpelling(word: string): Promise<string> {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1');
+      const ai = this.getAI();
       const response = await ai.models.generateContent({
-        model: "gemini-1.5-flash",
-        contents: `Correct spelling: "${word}". Return ONLY the word.`,
+        model: "gemini-3-flash-preview",
+        contents: `Correct the spelling of the following English word: "${word}". Return ONLY the corrected word.`,
       });
-      return response.text?.trim().toLowerCase() || word.toLowerCase();
+
+      return response.text?.trim().toLowerCase().replace(/[^a-z\s-]/g, '') || word.toLowerCase();
     });
   }
 
   async getMnemonic(word: string, targetLanguage: Language): Promise<MnemonicResponse> {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1');
+      const ai = this.getAI();
       const response = await ai.models.generateContent({
-        model: "gemini-1.5-flash",
-        contents: `Generate mnemonic for "${word}" in ${targetLanguage}.`,
+        model: "gemini-3-flash-preview",
+        contents: `Generate a mnemonic for the English word "${word}" for a ${targetLanguage} speaker.`,
         config: {
           responseMimeType: "application/json",
           responseSchema: {
@@ -97,59 +113,88 @@ export class GeminiService {
               imagination: { type: Type.STRING },
               phoneticLink: { type: Type.STRING },
               connectorSentence: { type: Type.STRING },
-              examples: { type: Type.ARRAY, items: { type: Type.STRING } },
-              synonyms: { type: Type.ARRAY, items: { type: Type.STRING } },
+              examples: { 
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+              },
+              synonyms: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+              },
               level: { type: Type.STRING },
               category: { type: Type.STRING },
               imagePrompt: { type: Type.STRING }
             },
             required: ["word", "transcription", "meaning", "morphology", "imagination", "phoneticLink", "connectorSentence", "examples", "synonyms", "level", "category", "imagePrompt"]
-          }
-        }
+          },
+          systemInstruction: `Role: You are a Linguistic Mnemonic Architect. Help users acquire English vocabulary using the Keyword Method.
+          
+          Instructions:
+          1. Acoustic Link (phoneticLink): Identify a keyword in ${targetLanguage} that sounds like the English word.
+          2. Imagery Link (imagination): Create a vivid, absurd mental image where the keyword and meaning interact.
+          3. All explanatory fields MUST be in ${targetLanguage}.
+          4. Return ONLY valid JSON.`
+        },
       });
-      return JSON.parse(response.text || '{}');
+
+      const text = response.text;
+      if (!text) throw new Error("Empty response from AI");
+      return JSON.parse(text);
     });
   }
 
   async generateImage(prompt: string): Promise<string> {
+    // Placeholder for image generation
     return `https://picsum.photos/seed/${encodeURIComponent(prompt)}/1024/1024`;
   }
 
   async generateTTS(text: string, targetLanguage: Language): Promise<string> {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1beta');
+      const ai = this.getAI();
+      
+      const languageName = targetLanguage === Language.ENGLISH ? 'English' : targetLanguage;
+
       const response = await ai.models.generateContent({
-        model: "gemini-1.5-flash",
-        contents: [{ parts: [{ text: `Speak naturally in ${targetLanguage}: "${text}"` }] }],
-        config: { responseModalities: [Modality.AUDIO] },
+        model: "gemini-2.5-flash-preview-tts",
+        contents: [{ 
+          parts: [{ 
+            text: `Say cheerfully: ${text}` 
+          }] 
+        }],
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: 'Kore' },
+            },
+          },
+        },
       });
-      return response.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data || '';
+
+      const audioData = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+      if (audioData) {
+        return audioData;
+      }
+      
+      console.error("TTS Response missing audio parts:", response);
+      return '';
     });
   }
 
   async getPracticeResponse(word: string, meaning: string, targetLanguage: Language, history: any[], level?: 'Easy' | 'Medium' | 'Hard' | 'EasyToHard', sentenceCount: number = 0) {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1');
+      const ai = this.getAI();
       
-      const levelInstructions = {
-        Easy: "Focus on SIMPLE sentences (Subject + Verb + Object). Use high-frequency, basic vocabulary. Example structure: 'The cat sits on the mat.'",
-        Medium: "Focus on COMPOUND sentences using 'and,' 'but,' or 'or.' Encourage the use of common adverbs. Example structure: 'The cat sits on the mat, but the dog is outside.'",
-        Hard: "Focus on COMPLEX sentences with relative clauses, passive voice, or conditional tense. Example structure: 'Although it was raining, the cat remained on the mat that was placed near the fire.'",
-        EasyToHard: `This is a progressive session. 
-          - For sentences 1-2: Use EASY level (Simple sentences).
-          - For sentences 3-4: Use MEDIUM level (Compound sentences).
-          - For sentence 5: Use HARD level (Complex sentences).
-          Current sentence number: ${sentenceCount + 1}.`
-      };
-
-      const selectedLevelInstruction = level ? levelInstructions[level] : levelInstructions.Easy;
       const displayLevel = level === 'EasyToHard' 
         ? (sentenceCount < 2 ? 'Easy' : sentenceCount < 4 ? 'Medium' : 'Hard')
         : (level || 'Easy');
 
       const response = await ai.models.generateContent({
-        model: "gemini-1.5-flash",
-        contents: history.length > 0 ? history : [{ role: 'user', parts: [{ text: `Hi! I want to practice the word "${word}". I've chosen the ${level === 'EasyToHard' ? 'Easy to Hard' : (level || 'Easy')} level. Please start the session in ${targetLanguage}.` }] }],
+        model: "gemini-3-flash-preview",
+        contents: history.length > 0 ? history : [{
+          role: 'user',
+          parts: [{ text: `Hi! I want to practice the word "${word}". Level: ${displayLevel}. Language: ${targetLanguage}.` }]
+        }],
         config: {
           responseMimeType: "application/json",
           responseSchema: {
@@ -162,23 +207,10 @@ export class GeminiService {
             required: ["feedback", "isCorrect", "sessionComplete"]
           },
           systemInstruction: `You are a helpful English Practice Partner. 
-          The user is learning the word "${word}" (meaning: ${meaning}).
-          Your goal is to help them practice using this word in context at the ${displayLevel} level.
-          
-          Level-Specific Sentence Requirements:
-          ${selectedLevelInstruction}
-          
-          Instructions:
-          1. Communicate EXCLUSIVELY in ${targetLanguage}. 
-          2. Give the user a specific scenario or question in ${targetLanguage} that requires them to use the English word "${word}".
-          3. The user MUST respond in English using the sentence structure appropriate for the ${displayLevel} level.
-          4. Evaluate their English sentence. 
-          5. If it's correct and matches the level's complexity, set isCorrect to true, provide praise in the feedback field, and give a new challenge.
-          6. If it's incorrect or too simple for the level, set isCorrect to false, gently correct or guide them in the feedback field, and ask them to try again.
-          7. This is a 5-step practice session. After 5 successful English sentences, set sessionComplete to true, congratulate them warmly in the feedback field, and tell them they have mastered the word!
-          8. Keep your feedback concise (max 2-3 sentences).
-          9. Return ONLY a valid JSON object.`,
-        }
+          The user is learning "${word}" (meaning: ${meaning}).
+          Communicate EXCLUSIVELY in ${targetLanguage}. 
+          Evaluate their English sentence at the ${displayLevel} level.`,
+        },
       });
       return response.text;
     });
@@ -186,10 +218,11 @@ export class GeminiService {
 
   async generateNuance(word: string, synonyms: string[], targetLanguage: Language): Promise<any> {
     return this.withRetry(async () => {
-      const ai = this.getAI('v1');
+      const ai = this.getAI();
+      const synonymsList = synonyms && synonyms.length > 0 ? synonyms.join(', ') : 'common synonyms';
       const response = await ai.models.generateContent({
-        model: "gemini-1.5-flash",
-        contents: `Nuance of "${word}" vs ${synonyms.join(', ')} for ${targetLanguage} speaker.`,
+        model: "gemini-3-flash-preview",
+        contents: `Explain nuance: "${word}" vs ${synonymsList} for ${targetLanguage} speaker.`,
         config: {
           responseMimeType: "application/json",
           responseSchema: {
@@ -218,10 +251,14 @@ export class GeminiService {
               }
             },
             required: ["coreDifference", "comparisonTable", "commonMistake"]
-          }
+          },
+          systemInstruction: `You are an expert English Language Coach. Explain nuances in ${targetLanguage}.`
         }
       });
-      return JSON.parse(response.text || '{}');
+
+      const text = response.text;
+      if (!text) throw new Error("Empty response from AI");
+      return JSON.parse(text);
     });
   }
 }
