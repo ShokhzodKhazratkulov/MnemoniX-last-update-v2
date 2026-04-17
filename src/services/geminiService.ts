@@ -20,7 +20,7 @@ export class GeminiService {
       .filter((k: string) => k.length > 0);
       
     if (this.apiKeys.length === 0) {
-      throw new Error("No valid Gemini API keys found in GEMINI_API_KEY.");
+      throw new Error("No valid Gemini API keys found in VITE_GEMINI_API_KEYS.");
     }
   }
 
