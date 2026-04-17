@@ -495,6 +495,17 @@ export default function App() {
     const query = (word || searchQuery).toLowerCase().trim();
     if (!query) return;
 
+    // Sanitize input: only single word, phrases, and 2 word which gives one meaning
+    // We limit this by checking the word count and ensuring it doesn't look like a sentence with many digits or symbols.
+    const cleanQuery = query.replace(/[0-9]/g, '').trim();
+    const wordsCount = cleanQuery.split(/\s+/).filter(Boolean).length;
+    
+    if (wordsCount > 4 || wordsCount === 0) {
+      setError(t.errorTooManyWords);
+      setState(AppState.ERROR);
+      return;
+    }
+
     if (word) setSearchQuery(word);
 
     // Check cache
